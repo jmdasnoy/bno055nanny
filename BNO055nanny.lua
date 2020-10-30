@@ -1,16 +1,48 @@
--- handler for Bosch Sensortech IMU BNO055
--- for more details refer to datasheet: BST-BNO055-DS000-14 | Revision 1.4 | June 2016
+-- jmdasnoy scripsit 2020 copyright MIT license
+-- ESP32 nodeMCU Lua 5.1 handler for Bosch Sensortech IMU BNO055
+-- according to datasheet: BST-BNO055-DS000-16 | Revision 1.6 | February 2020
+--
+-- *** TODO FIX ME
+-- power modes PWR_MODE register
+-- startup time (from OFF to config mode) is typically 400 ms
+-- power on reset time (from reset to config mode) is typ 600 ms
+-- during these periods, the i2c will not respond !
+-- time to switch from config to operation is 7 ms
+-- time to switch from operation to config is 19 ms
+-- axis remap
+-- defaut sensor settings
+-- extract acceleration, magneto and gyro readings
+-- extract euler, quaternion, linear acceleration and gravity
+-- registers in pages ?
+--
+-- Default orientation:
+-- the dot on the chip is in the North-East corner
+-- North is +Y, East is +X, Up is +Z
+-- heading is 0 for North, 90 for East etc
+-- pitch increasing for nose-down (Z moving towards Y)
+-- roll increasing for right wing up (X moving towards Z)
+--
+-- accelerometer is factory calibrated
+-- gyro calibration needs a few seconds of stationary
+-- magneto calibration 3 (&2) are ok, 1 requires figure-8 calibration, 0 means environment changed
+-- not using Built In Self Test BIST
+--
+-- Notes:
 --
 -- the ESP-32 Huzzah has weakup (10 K) pullups on the i2c bus pins
 -- additional pullups SCL 3K3 SDA 2K2 are advised for reliable operation
 --
--- CALIB_STAT (bits: ssggaamm) is buggy, system and accelerometer bits can be ignored !
+-- The BNO uses clock stretching. With fast i2c clocks, this may trigger the ESP32 timeout on hardware i2c subsystems.
+-- A i2c clock speed of 30KHz or slower is advised.
+--
+-- The CALIB_STAT readout (bits: ssggaamm) is buggy, system and accelerometer bits should be ignored !
+--
 -- populate table with register addresses, reset/read values, symbolic settings, expected values ie settings
 local function populatetable()
   local bno={}
 -- i2c particulars and defaults
   bno.i2cinterface =i2c.HW0
-  bno.i2caddress = 0x28  -- if pin COM3 is low like on Adafruit board, otherwise 0x29
+  bno.i2caddress = 0x28  -- if pin ADR/COM3 is low (like on Adafruit breakout board), otherwise 0x29
 -- 
   bno.register = {} -- register hardware addresses
   bno.value = {} -- last read value from chip
@@ -42,7 +74,8 @@ local function populatetable()
   bno.lookup.ST_RESULT = { OK = 0xf}
   bno.register.SYS_STATUS = 0x39
   bno.lookup.SYS_STATUS = { IDLE = 0, ERROR = 1, FUSIONRUN = 5, RAWRUN = 6 }
---  bno.register.SYS_ERR = 0x3a
+-- other SYS_STATUS values  InitializingPeripherals = 2, SystemInitialisation = 3, Executing Selftest = 4
+--  bno.register.SYS_ERR = 0x3a  -- contents are defined only if SYS_STATUS is ERROR
   bno.register.UNIT_SEL = 0x3b
   bno.value.UNIT_SEL = 0x80
 --
@@ -65,7 +98,7 @@ local function populatetable()
   bno.reset_count = 0
   bno.reset_max = 5  -- 5 attempts for chip reset
   bno.wait_count = 0
-  bno.wait_count_max = 5  -- wait for OPR_MODE in CONFIGMODE or initialisation to complete
+  bno.wait_max = 5  -- wait for OPR_MODE in CONFIGMODE or initialisation to complete
 --
 -- values derived by handler routines
   bno.HEALTH = false
@@ -105,9 +138,12 @@ local chip_err
 local post_err
 local status_err
 local status_wait
+local status_nowait
 --
 checkchip = function( self ) -- state 1: attempt to get a response from the bus/address and compare with expected signature
+---[[
   print( "checking i2c connectivity and chip signature" )
+--]]
   readbytes( self.i2cinterface, self.i2caddress, self.register.CHIP_ID, 6,
     function( data, ack )
       if not ack then
@@ -115,7 +151,9 @@ checkchip = function( self ) -- state 1: attempt to get a response from the bus/
       else
         i2c_ok( self )
         if data == self.signature then
+---[[
           print ( "Chip signature ok")
+--]]
           self.state = checkpost
         else
           chip_err( self, data )
@@ -126,7 +164,9 @@ checkchip = function( self ) -- state 1: attempt to get a response from the bus/
 end
 --
 checkpost = function( self )  -- state 2: check POST
+---[[
   print( "checking BNO055 self test results" )
+--]]
   readbytes( self.i2cinterface, self.i2caddress, self.register.ST_RESULT, 1,
     function( data, ack )
       if not ack then
@@ -135,7 +175,9 @@ checkpost = function( self )  -- state 2: check POST
         i2c_ok( self )
         if data:byte( 1,1 ) == self.lookup.ST_RESULT.OK  then
           self.state = checkstatus
+---[[
           print ( "BNO055 POST ok" )
+--]]
         else
           post_err( self, data:byte( 1,1 ) )
         end
@@ -145,7 +187,9 @@ checkpost = function( self )  -- state 2: check POST
 end
 --
 checkstatus = function ( self )  -- state 3: check SYS_STATUS and SYS_ERR
+---[[
   print( "checking BNO055 system status and errors" )
+--]]
   readbytes( self.i2cinterface, self.i2caddress, self.register.SYS_STATUS, 2,
     function( data, ack )
       if not ack then
@@ -154,18 +198,27 @@ checkstatus = function ( self )  -- state 3: check SYS_STATUS and SYS_ERR
         i2c_ok( self )
         local status = data:byte( 1, 1 )
         local error = data:byte( 2 ,2 )
+---[[
         print ( "BNO055 SYS_STATUS SYS_ERR: ",status,error)
+--]]
         if status == self.lookup.SYS_STATUS.IDLE then
+          status_nowait( self )
           forceconfig( self )
           self.state = checkconfig  -- system idle, ok to configure
         elseif status == self.lookup.SYS_STATUS.ERROR then -- system error
+          status_nowait( self )
           status_err( self, error )
         elseif status == self.lookup.SYS_STATUS.FUSIONRUN or status == self.lookup.SYS_STATUS.RAWRUN then
-          print( "System running already, must go back to config mode" )
+---[[
+          print( "System already running, must go back to config mode" )
+--]]
+          status_nowait( self )
           self.state = configreset  -- system running, need to set OPR_MODE to CONFIGMODE before configuring
         else
-          print( "BNO055 still busy initialising, please wait...")  -- codes 2,3,4 for initialising and selftest, wait for next tick
-          status_wait( self, status )
+---[[
+          print( "BNO055 still busy initialising, please wait...")
+--]]
+          status_wait( self, status ) -- codes 2,3,4 for peripheral init, system init and selftest, wait for next tick or timeout
         end
       end
     end
@@ -173,19 +226,24 @@ checkstatus = function ( self )  -- state 3: check SYS_STATUS and SYS_ERR
 end
 --
 configreset = function( self ) -- state 4 : set OPR_MODE to CONFIGMODE, clear effective read values to reset values
+---[[
   print( "Setting OPR_MODE back to CONFIGMODE" )
+--]]
   writeandreadbackbytes( self.i2cinterface, self.i2caddress, self.register.OPR_MODE, self.lookup.OPR_MODE.CONFIGMODE,
     function( data, ack )
       if not ack then
         i2c_err( self )
       else
         i2c_ok( self )
-        if data:byte( 1, 1) == self.lookup.OPR_MODE.CONFIGMODE then 
+        if data:byte( 1, 1) == self.lookup.OPR_MODE.CONFIGMODE then
+          status_nowait( self )
           forceconfig( self )
           self.state = checkconfig
         else
-          status_wait( self, data )
-          print( "Attempt to put chip back into config mode did not succeed" )
+          status_wait( self, data ) -- try again until time out
+---[[
+          print( "Attempt to put chip back into config mode did not succeed, trying again" )
+--]]
         end
       end
     end
@@ -193,21 +251,29 @@ configreset = function( self ) -- state 4 : set OPR_MODE to CONFIGMODE, clear ef
 end
 --
 checkconfig = function ( self )  -- state 5: check configuration requests and apply them
+---[[
   print( "checking/setting BNO055 configuration" )
+--]]
 -- check settings needed,changing OPR_MODE must be done last when all others are ok, so there will be time for OPR_MODE to establish before next tick
   local tryk, tryv
   for k,v in pairs( self.setting ) do
     print( k, v, self.value[ k] )
     if v ~= self.value[ k ] then
-      if not (k == "OPR_MODE" and tryk) then tryk, tryv = k, v end -- ignore OPR_MODE request if there is any other already
+      if not (k == "OPR_MODE" and tryk) then tryk, tryv = k, v end -- ignore OPR_MODE request until last
+---[[
       print( "setup required for register", k)
+--]]
+---[[
     else
       print( "setting ok for register: ", k)
+--]]
     end
   end
 --
   if tryk then
+---[[
     print( " attempting configuration of : ", tryk, tryv )
+--]]
     writeandreadbackbytes( self.i2cinterface, self.i2caddress, self.register[ tryk ], tryv,
       function( data, ack )
         if not ack then
@@ -216,19 +282,27 @@ checkconfig = function ( self )  -- state 5: check configuration requests and ap
           i2c_ok( self )
           local newv = data:byte( 1, 1 )
           self.value[ tryk] = newv
+---[[
           print ( "Read back of configured value for register: ", tryk, newv )
+--]]
         end
       end
     )
   else
+---[[
    print ( "Configuration complete" )
+--]]
    self.state = checkcalib -- move to next FSM state
   end
+---[[
   print( "exiting checkconfig BNO055" )
+--]]
 end
 --
 checkcalib = function( self )  -- state 6: check for effective calibration
+---[[
   print( "Check for BNO055 calibration" )
+--]]
   readbytes( self.i2cinterface, self.i2caddress, self.register.CALIB_STAT, 1,
     function( data, ack )
       if not ack then
@@ -239,9 +313,13 @@ checkcalib = function( self )  -- state 6: check for effective calibration
         self.value.CALIB_STAT = calibvalue
         if bit.band( calibvalue, 0x30 ) > 0 and bit.band( calibvalue, 0x03 ) > 0 then  -- gyro and magneto calib at least 1
           self.state = showcalib
+---[[
           print( ("BNO055 calibration effective: 0x%x"):format( calibvalue ) )
+--]]
         else
-          print( ("Incomplete BNO055 calibration: 0x%x"):format( calibvalue ) )
+---[[
+          print( ("Incomplete BNO055 calibration: 0x%x"):format( calibvalue ) , " ...waiting" )
+--]]
 --          post_err( self, calibvalue) ) -- *** FIX ME add a max limit ?
         end
       end
@@ -250,13 +328,16 @@ checkcalib = function( self )  -- state 6: check for effective calibration
 end
 --
 showcalib = function( self )  -- state 7: show and store calibration values
+---[[
   print( "Showing calibration values" )
+--]]
   readbytes( self.i2cinterface, self.i2caddress, self.register.ACC_OFFSET_X_LSB, 22,
     function( data, ack )
       if not ack then
         i2c_err( self )
       else
         i2c_ok( self )
+---[[
         for i=1, 5 , 2 do
           print( ("ACC offset: 0x%x"):format( data:byte( i ) + 256 * data:byte( i+1 ) ) )
         end
@@ -269,6 +350,7 @@ showcalib = function( self )  -- state 7: show and store calibration values
         print( ("ACC radius: 0x%x"):format( data:byte( 19 ) + 256 * data:byte( 20 ) ) )
         print( ("MAG radius: 0x%x"):format( data:byte( 21 ) + 256 * data:byte( 22 ) ) )
         print( ("Serialized string value:%q"):format( data ) )
+--]]
         self.state = monitor -- *** FIX ME write out calib values to file -- ** FIX ME update ok indicator
       end
     end
@@ -276,11 +358,15 @@ showcalib = function( self )  -- state 7: show and store calibration values
 end
 --
 monitor = function( self )  -- state 8: monitor system health
---  print( "Monitoring BNO055 health" )
+---[[
+  print( "Monitoring BNO055 health" )
+--]]
   readbytes( self.i2cinterface, self.i2caddress, self.register.TEMP, 10,
     function( data, ack )
       if not ack then
+---[[
         print( "monitor didn't get an answer" ) --*** FIX ME remove after debugging
+--]]
         i2c_err( self )
       else
         i2c_ok( self )
@@ -294,9 +380,11 @@ monitor = function( self )  -- state 8: monitor system health
         self.value.UNIT_SEL = data:byte( 8 )
         local oprmode = data:byte( 10 )
         self.value.OPR_MODE = oprmode
-        if bit.band( calibvalue, 0x33 ) < 0x11 or sysstatus < self.lookup.SYS_STATUS.FUSIONRUN then
+        if bit.band( calibvalue, 0x30 ) < 2 or bit.band( calibvalue, 0x03 ) < 2  or sysstatus < self.lookup.SYS_STATUS.FUSIONRUN then
+---[[
           print( "BNO055 health problem at time:" , time.get() )
-          print( ("SYS_STATUS: %d SYS_ERROR: %d CALIB_STAT: 0x%x OPR_MODE: 0x%x"):format( sysstatus, syserror, calibvalue, oprmode ) )  
+          print( ("SYS_STATUS: %d SYS_ERROR: %d CALIB_STAT: 0x%x OPR_MODE: 0x%x"):format( sysstatus, syserror, calibvalue, oprmode ) )
+--]]
           self.HEALTH = false --*** FIX ME do something about it, try to fix this
           fsm_disable( self )
         else
@@ -317,7 +405,9 @@ geteuler = function( self )
   readbytes( self.i2cinterface, self.i2caddress, self.register.EULER_HEADING_LSB, 6,
     function( data, ack )
       if not ack then
+---[[
         print( "geteuler didn't get an answer" ) --*** FIX ME remove after debugging
+--]]
         i2c_err( self )
       else
         i2c_ok( self )
@@ -367,7 +457,9 @@ writeandreadbackbytes = function( interface, address, register, value, callback)
 end
 --
 resetchip = function( self )
+---[[
   print( "Resetting chip" )
+--]]
   writebytes( self.i2cinterface, self.i2caddress, self.register.SYS_TRIGGER, self.lookup.SYS_TRIGGER.RST_SYS,
     function( data, ack )
       if not ack then
@@ -384,9 +476,10 @@ resetchip = function( self )
   )
 end
 --
-forceconfig = function( self )
--- for each setting, set effective value to nil
+forceconfig = function( self ) -- for each setting, set effective value to nil
+---[[
   print( "Forcing values for complete configuration" )
+--]]
   for k, _ in pairs( self.setting ) do
     self.value[ k ] = nil
   end
@@ -400,6 +493,12 @@ end
 i2c_ok = function( self )
   if self.i2c_err_count > 0 then
     self.i2c_err_count = self.i2c_err_count - 1
+  end
+end
+--
+status_nowait = function( self )
+  if self.wait_count > 0 then
+    self.wait_count = self.wait_count - 1
   end
 end
 -- error handlers
@@ -430,7 +529,7 @@ end
 --
 status_wait = function( self, data )
   self:status_wait_log( data )
-  if self.wait_count < self.wait_count_max then
+  if self.wait_count < self.wait_max then
     self.wait_count = self.wait_count + 1
   else
     fsm_disable( self )
@@ -467,29 +566,45 @@ end
 --
 local function configure( self, t ) -- add requested configuration settings
 -- keys are register names, lookup value in lookup table if any or use the value as such (8bit int)
+---[[
   print( "Entering configuration settings")
+--]]
   for k,v in pairs( t ) do
+---[[
     print("configure: ",k,v)
+--]]
     if self.register[ k ] then  -- valid register name
       if self.lookup[ k ] then  -- register has a lookup table for symbolic values
         if self.lookup[ k ][ v] then -- symbolic value is known
           self.setting[ k ] = ( self.lookup[ k ] )[ v]
+---[[
           print("Configure setting register: ",k,  "with symbolic value: ", v )
+--]]
         else  -- unknown symbolic value
+---[[
           print("Configure ignoring unknown symbolic value: ", v, "for register: ", k)
+--]]
         end
       else -- no lookup table, use value as such
         if type(v) == "number" and v >= 0 and v<=255 then -- valid 8 bit literal value
-          self.setting[ k ] =  v 
+          self.setting[ k ] =  v
+---[[
           print("Configure setting register: ", k, "with literal value: ",v )
+--]]
         else -- literal value is longer than 8 bits
+---[[
           print("Configure ignoring invalid literal value: ",v, "for register: ", k )
+--]]
         end
       end
+---[[
     else print( "Configure ignoring unknown BNO055 register: ", k )
+--]]
     end
   end
+---[[
   print( "Leaving configuration settings")
+--]]
 -- *** FIX ME check FSM state and request adjustment if needed
 end
 --
@@ -515,4 +630,3 @@ local function new( interface, address )
 end
 --
 return { new = new }
---FileView done.
