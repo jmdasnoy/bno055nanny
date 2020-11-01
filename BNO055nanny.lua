@@ -4,28 +4,39 @@
 --
 -- *** TODO FIX ME
 -- power modes PWR_MODE register
--- startup time (from OFF to config mode) is typically 400 ms
--- power on reset time (from reset to config mode) is typ 600 ms
--- during these periods, the i2c will not respond !
--- time to switch from config to operation is 7 ms
--- time to switch from operation to config is 19 ms
+
 -- axis remap
 -- defaut sensor settings
 -- extract acceleration, magneto and gyro readings
 -- extract euler, quaternion, linear acceleration and gravity
 -- registers in pages ?
+-- soft iron calibration and matrix reuse ?
+-- heading, tilt and pitch offsets to correct mounting imprecision
+-- tilt and pitch could be automatic if sufficient period of no-change ?
+--
+-- Startup and mode mode changes:
+-- startup time (from OFF to config mode) is typically 400 ms
+-- power on reset time (from reset to config mode) is typ 600 ms
+-- during these periods, the i2c will not respond !
+-- time to switch from config to operation is 7 ms
+-- time to switch from operation to config is 19 ms
 --
 -- Default orientation:
 -- the dot on the chip is in the North-East corner
 -- North is +Y, East is +X, Up is +Z
--- heading is 0 for North, 90 for East etc
--- pitch increasing for nose-down (Z moving towards Y)
--- roll increasing for right wing up (X moving towards Z)
+-- heading is 0 for North, 90 for East ie increasing when CW on Z axis
+-- pitch increasing for nose-down (Z moving towards Y) ie CW on Y axis
+-- roll increasing for right wing up (X moving towards Z) ie CW on X axis
+-- only the direction of increasing pitch can be chosen (Android vs Windows convention)
 --
 -- accelerometer is factory calibrated
 -- gyro calibration needs a few seconds of stationary
 -- magneto calibration 3 (&2) are ok, 1 requires figure-8 calibration, 0 means environment changed
+-- for COMPASS mode, no gyro calibration !!! CALIB_STAT is Oxc3
 -- not using Built In Self Test BIST
+-- The CALIB_STAT readout (bits: ssggaamm) is buggy, system and accelerometer bits should be ignored !
+--
+-- *** FIX ME store and retrieve calibration values for faster/easier startup
 --
 -- Notes:
 --
@@ -94,14 +105,15 @@ local function populatetable()
 --
 -- error counters and limits
   bno.i2c_err_count = 0
-  bno.i2c_err_max = 5 -- initially 5 attempts for i2c ack detection
+  bno.i2c_err_max = 5 -- max number of cumulative i2c errors
   bno.reset_count = 0
-  bno.reset_max = 5  -- 5 attempts for chip reset
+  bno.reset_max = 5  -- max number of chip reset attempts
   bno.wait_count = 0
-  bno.wait_max = 5  -- wait for OPR_MODE in CONFIGMODE or initialisation to complete
---
+  bno.wait_max = 5  -- max number of tick waits wait setting OPR_MODE to CONFIGMODE or for initialisation to complete
+-- default name for bno
+  bno.name = "BNO055"
 -- values derived by handler routines
-  bno.HEALTH = false
+  bno.health = "STOP" -- other values are INIT , CALIB, RUN or ERROR
   bno.HEADING = 0
   bno.ROLL = 0
   bno.PITCH = 0
@@ -155,6 +167,7 @@ checkchip = function( self ) -- state 1: attempt to get a response from the bus/
           print ( "Chip signature ok")
 --]]
           self.state = checkpost
+          self.health = "INIT"
         else
           chip_err( self, data )
         end
@@ -206,6 +219,8 @@ checkstatus = function ( self )  -- state 3: check SYS_STATUS and SYS_ERR
           forceconfig( self )
           self.state = checkconfig  -- system idle, ok to configure
         elseif status == self.lookup.SYS_STATUS.ERROR then -- system error
+-- *** FIX ME sys_error codes of 4 and above can be caused by usr program, not chip failure
+-- *** this status seems to persist, no hint on how to clear this except with a full reset
           status_nowait( self )
           status_err( self, error )
         elseif status == self.lookup.SYS_STATUS.FUSIONRUN or status == self.lookup.SYS_STATUS.RAWRUN then
@@ -260,10 +275,10 @@ checkconfig = function ( self )  -- state 5: check configuration requests and ap
     print( k, v, self.value[ k] )
     if v ~= self.value[ k ] then
       if not (k == "OPR_MODE" and tryk) then tryk, tryv = k, v end -- ignore OPR_MODE request until last
----[[
+--[[
       print( "setup required for register", k)
 --]]
----[[
+--[[
     else
       print( "setting ok for register: ", k)
 --]]
@@ -271,7 +286,7 @@ checkconfig = function ( self )  -- state 5: check configuration requests and ap
   end
 --
   if tryk then
----[[
+--[[
     print( " attempting configuration of : ", tryk, tryv )
 --]]
     writeandreadbackbytes( self.i2cinterface, self.i2caddress, self.register[ tryk ], tryv,
@@ -282,17 +297,18 @@ checkconfig = function ( self )  -- state 5: check configuration requests and ap
           i2c_ok( self )
           local newv = data:byte( 1, 1 )
           self.value[ tryk] = newv
----[[
+--[[
           print ( "Read back of configured value for register: ", tryk, newv )
 --]]
         end
       end
     )
   else
----[[
+-- [[
    print ( "Configuration complete" )
 --]]
    self.state = checkcalib -- move to next FSM state
+   self.health = "CALIB"
   end
 ---[[
   print( "exiting checkconfig BNO055" )
@@ -300,7 +316,7 @@ checkconfig = function ( self )  -- state 5: check configuration requests and ap
 end
 --
 checkcalib = function( self )  -- state 6: check for effective calibration
----[[
+--[[
   print( "Check for BNO055 calibration" )
 --]]
   readbytes( self.i2cinterface, self.i2caddress, self.register.CALIB_STAT, 1,
@@ -311,7 +327,9 @@ checkcalib = function( self )  -- state 6: check for effective calibration
         i2c_ok( self )
         local calibvalue = data:byte( 1 )
         self.value.CALIB_STAT = calibvalue
-        if bit.band( calibvalue, 0x30 ) > 0 and bit.band( calibvalue, 0x03 ) > 0 then  -- gyro and magneto calib at least 1
+-- very kludgy, system and accelerometer bits are buggy, compass mode has no gyro but ndof does...
+-- read value mask and expected values are different for each operation mode :-
+        if ( bit.rshift( bit.band( calibvalue, 0x30 ) , 4) + bit.band( calibvalue, 0x03 )) >= 2 then  -- sum of gyro and magneto calib at least 2
           self.state = showcalib
 ---[[
           print( ("BNO055 calibration effective: 0x%x"):format( calibvalue ) )
@@ -320,7 +338,7 @@ checkcalib = function( self )  -- state 6: check for effective calibration
 ---[[
           print( ("Incomplete BNO055 calibration: 0x%x"):format( calibvalue ) , " ...waiting" )
 --]]
---          post_err( self, calibvalue) ) -- *** FIX ME add a max limit ?
+--          post_err( self, calibvalue) ) -- *** FIX ME add a max limit ? -- Don't use post_err for this
         end
       end
     end
@@ -337,7 +355,7 @@ showcalib = function( self )  -- state 7: show and store calibration values
         i2c_err( self )
       else
         i2c_ok( self )
----[[
+--[[
         for i=1, 5 , 2 do
           print( ("ACC offset: 0x%x"):format( data:byte( i ) + 256 * data:byte( i+1 ) ) )
         end
@@ -349,16 +367,32 @@ showcalib = function( self )  -- state 7: show and store calibration values
         end
         print( ("ACC radius: 0x%x"):format( data:byte( 19 ) + 256 * data:byte( 20 ) ) )
         print( ("MAG radius: 0x%x"):format( data:byte( 21 ) + 256 * data:byte( 22 ) ) )
-        print( ("Serialized string value:%q"):format( data ) )
 --]]
-        self.state = monitor -- *** FIX ME write out calib values to file -- ** FIX ME update ok indicator
+        local calibv = ("%q"):format( data )
+        local calibfn = self.name.."calibration"
+        print( "writing out ",calibv, "to file: ", calibfn )
+        local fh = file.open( calibfn , "w+")
+        if fh then
+          fh:writeline( self.name..".calib="..calibv )
+          fh:flush()
+          fh:close()
+          fh = nil
+        else
+-- *** FIX ME improve error reporting ?
+          print( "Could not write calibration values to file :", calibfn )
+        end
+-- *** FIX ME write out calib values to file self.name .."calibration.lua"-- ** FIX ME update ok indicator
+        self.state = monitor 
+        self.health = "RUN"
+        self.reset_count = 0
+        self.wait_count = 0
       end
     end
   )
 end
 --
 monitor = function( self )  -- state 8: monitor system health
----[[
+--[[
   print( "Monitoring BNO055 health" )
 --]]
   readbytes( self.i2cinterface, self.i2caddress, self.register.TEMP, 10,
@@ -380,15 +414,25 @@ monitor = function( self )  -- state 8: monitor system health
         self.value.UNIT_SEL = data:byte( 8 )
         local oprmode = data:byte( 10 )
         self.value.OPR_MODE = oprmode
-        if bit.band( calibvalue, 0x30 ) < 2 or bit.band( calibvalue, 0x03 ) < 2  or sysstatus < self.lookup.SYS_STATUS.FUSIONRUN then
+        if sysstatus < self.lookup.SYS_STATUS.FUSIONRUN then -- if not providing data, move back to state checkstatus
+--- *** FIX ME SYS_ERROR of 4 and above can result from programming mistakes, like reading/writing out of range registers not chip failure
+--- *** No hint on how to reset these !!!
 ---[[
-          print( "BNO055 health problem at time:" , time.get() )
+          print( "BNO055 SYS_STATUS problem at time:" , time.get() )
+          print( ("SYS_STATUS: %d SYS_ERROR: %d CALIB_STAT: 0x%x OPR_MODE: 0x%x"):format( sysstatus, syserror, calibvalue, oprmode ) )
+          print( "BNO system status idle, error or setting up, moving back to check status")
+--]]  
+          self.state = checkstatus
+          self.health = "INIT"
+        elseif ( bit.rshift( bit.band( calibvalue, 0x30 ) , 4) + bit.band( calibvalue, 0x03 )) < 2  then -- back to calibration state
+---[[
+          print( "BNO055 calibration problem at time:" , time.get() )
           print( ("SYS_STATUS: %d SYS_ERROR: %d CALIB_STAT: 0x%x OPR_MODE: 0x%x"):format( sysstatus, syserror, calibvalue, oprmode ) )
 --]]
-          self.HEALTH = false --*** FIX ME do something about it, try to fix this
-          fsm_disable( self )
+          self.state = checkcalib
+          self.health = "INIT"
         else
-          self.HEALTH = true
+          self.health = "RUN"
         end
       end
     end
@@ -401,7 +445,7 @@ geteuler = function( self )
 -- return euler angles heading, roll +/-90, pitch +/-180
 -- raw heading is 0-5760 ie 360*16
 -- pitch and roll are full 16 bit 2's complement, 16 LSB per degree
-  if not self.HEALTH then return end
+  if not self.health == "RUN" then return end
   readbytes( self.i2cinterface, self.i2caddress, self.register.EULER_HEADING_LSB, 6,
     function( data, ack )
       if not ack then
@@ -486,6 +530,7 @@ forceconfig = function( self ) -- for each setting, set effective value to nil
 end
 --
 fsm_disable = function( self )
+  self.health = "ERROR"
   self.state = function() end
   self:fatal_err_log()
 end
@@ -534,33 +579,6 @@ status_wait = function( self, data )
   else
     fsm_disable( self )
   end
-end
--- default error loggers
-local function i2cnoresponse( self )
-  print( time.get() , "no response from i2c address : ", self.i2caddress, " bus: " , self.i2cinterface , "check address and connectivity")
-end
---
---
-local function badchipsignature( self, data )
-    print( "i2c device on bus: ", self.i2cinterface, " at address: ", self.i2caddress, "does not have the expected signature for BNO055")
-    print( "expected chip signature", self.signature:byte( 1, 6 ) )
-    print( "received chip signature", data:byte( 1, 6 ) )
-end
---
-local function badpost( self, data)
-  print( "BNO055 Power On Self Test failed with value: ", data )
-end
---
-local function badstatus( self, data )
-  print( "BNO055 system error: ", data )
-end
---
-local function waitstatus( self, data )
-  print( "BNO055 OPR_MODE is still not CONFIGMODE: ", data )
-end
---
-local function fatal( self )
-  print( "BNO055 handler is now disabled" )
 end
 --
 --
@@ -615,13 +633,14 @@ local function new( interface, address )
   bno.signature = string.char( bno.value.CHIP_ID, bno.value.ACC_ID, bno.value.MAG_ID, bno.value.GYR_ID, bno.value.SW_REV_ID_LSB, bno.value.SW_REV_ID_MSB )
 --
   bno.state = checkchip -- initial FSM state
--- default error reporting functions
-  bno.i2c_err_log = i2cnoresponse
-  bno.chip_err_log = badchipsignature
-  bno.post_err_log = badpost
-  bno.status_err_log = badstatus
-  bno.status_wait_log = waitstatus
-  bno.fatal_err_log = fatal
+-- default error reporting functions are set to do nothing
+  local function donothing() end
+  bno.i2c_err_log = donothing
+  bno.chip_err_log = donothing
+  bno.post_err_log = donothing
+  bno.status_err_log = donothing
+  bno.status_wait_log = donothing
+  bno.fatal_err_log = donothing
 -- exported functions
   bno.tick = tick
   bno.configure = configure
