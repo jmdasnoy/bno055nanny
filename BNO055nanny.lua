@@ -7,8 +7,7 @@
 
 -- axis remap
 -- defaut sensor settings
--- extract acceleration, magneto and gyro readings
--- extract euler, quaternion, linear acceleration and gravity
+
 -- registers in pages ?
 -- soft iron calibration and matrix reuse ?
 -- heading, tilt and pitch offsets to correct mounting imprecision
@@ -78,7 +77,18 @@ local function populatetable()
 --  bno.register.SW_REV_ID_MSB = 0x5
   bno.value.SW_REV_ID_MSB = 0x03
 --
-  bno.register.EULER_HEADING_LSB = 0x1a
+-- bno.register.BL_REV_ID = 0x06
+-- bno.value.BL_REV_ID = 0x15
+-- bno.register.PageID = 0x7
+  bno.register.ACC_DATA_X_LSB = 0x8
+  bno.register.MAG_DATA_X_LSB = 0x0e
+  bno.register.GYR_DATA_X_LSB = 0x14
+-- note lower case for fusion data registers
+  bno.register.EUL_heading_LSB = 0x1a
+  bno.register.QUA_data_w_LSB = 0x20
+  bno.register.LIA_data_X_LSB = 0x28
+  bno.register.GRAV_data_X_LSB = 0x2e
+--
   bno.register.TEMP = 0x34
   bno.register.CALIB_STAT = 0x35
   bno.register.ST_RESULT = 0x36
@@ -112,11 +122,31 @@ local function populatetable()
   bno.wait_max = 5  -- max number of tick waits wait setting OPR_MODE to CONFIGMODE or for initialisation to complete
 -- default name for bno
   bno.name = "BNO055"
--- values derived by handler routines
+-- health indicator
   bno.health = "STOP" -- other values are INIT , CALIB, RUN or ERROR
+-- values derived by handler routines
   bno.HEADING = 0
   bno.ROLL = 0
   bno.PITCH = 0
+  bno.W = 0
+  bno.X = 0
+  bno.Y = 0
+  bno.Z = 0
+  bno.GRAV_X = 0
+  bno.GRAV_Y = 0
+  bno.GRAV_Z = 0
+  bno.LIA_X = 0
+  bno.LIA_Y = 0
+  bno.LIA_Z = 0
+  bno.GYRO_X = 0
+  bno.GYRO_Y = 0
+  bno.GYRO_Z = 0
+  bno.MAG_X = 0
+  bno.MAG_Y = 0
+  bno.MAG_Z = 0
+  bno.ACC_X = 0
+  bno.ACC_Y = 0
+  bno.ACC_Z = 0
 --
   return bno
 end
@@ -131,12 +161,21 @@ local checkchip
 local checkpost
 local checkstatus
 local configreset
+local loadcalib
 local checkconfig
 local checkcalib
 local showcalib
 local monitor
--- forward declarations of read  functions
+-- forward declarations of read functions
+local getmagnetic
+local getgyro
+local getacc
 local geteuler
+local getquat
+local getgravity
+local getlia
+local getmagnetic
+local getgyro
 -- forward declarations of functions called from states
 local readbytes
 local writebytes
@@ -152,7 +191,7 @@ local status_err
 local status_wait
 local status_nowait
 --
-checkchip = function( self ) -- state 1: attempt to get a response from the bus/address and compare with expected signature
+checkchip = function( self ) -- FSM initial state: attempt to get a response from the bus/address and compare with expected signature
 ---[[
   print( "checking i2c connectivity and chip signature" )
 --]]
@@ -176,7 +215,7 @@ checkchip = function( self ) -- state 1: attempt to get a response from the bus/
   )
 end
 --
-checkpost = function( self )  -- state 2: check POST
+checkpost = function( self )  -- FSM state: check POST
 ---[[
   print( "checking BNO055 self test results" )
 --]]
@@ -199,7 +238,7 @@ checkpost = function( self )  -- state 2: check POST
   )
 end
 --
-checkstatus = function ( self )  -- state 3: check SYS_STATUS and SYS_ERR
+checkstatus = function ( self )  -- FSM state: check SYS_STATUS and SYS_ERR
 ---[[
   print( "checking BNO055 system status and errors" )
 --]]
@@ -217,7 +256,7 @@ checkstatus = function ( self )  -- state 3: check SYS_STATUS and SYS_ERR
         if status == self.lookup.SYS_STATUS.IDLE then
           status_nowait( self )
           forceconfig( self )
-          self.state = checkconfig  -- system idle, ok to configure
+          self.state = loadcalib  -- system idle, ok to configure
         elseif status == self.lookup.SYS_STATUS.ERROR then -- system error
 -- *** FIX ME sys_error codes of 4 and above can be caused by usr program, not chip failure
 -- *** this status seems to persist, no hint on how to clear this except with a full reset
@@ -240,7 +279,7 @@ checkstatus = function ( self )  -- state 3: check SYS_STATUS and SYS_ERR
   )
 end
 --
-configreset = function( self ) -- state 4 : set OPR_MODE to CONFIGMODE, clear effective read values to reset values
+configreset = function( self ) -- FSM state: set OPR_MODE to CONFIGMODE, clear effective read values to reset values
 ---[[
   print( "Setting OPR_MODE back to CONFIGMODE" )
 --]]
@@ -253,7 +292,7 @@ configreset = function( self ) -- state 4 : set OPR_MODE to CONFIGMODE, clear ef
         if data:byte( 1, 1) == self.lookup.OPR_MODE.CONFIGMODE then
           status_nowait( self )
           forceconfig( self )
-          self.state = checkconfig
+          self.state = loadcalib
         else
           status_wait( self, data ) -- try again until time out
 ---[[
@@ -265,7 +304,47 @@ configreset = function( self ) -- state 4 : set OPR_MODE to CONFIGMODE, clear ef
   )
 end
 --
-checkconfig = function ( self )  -- state 5: check configuration requests and apply them
+loadcalib = function( self )  -- FSMstate: load and apply previously stored calibration values, if any
+  local calibfn = self.name.."calibration"
+  if file.exists( calibfn ) then
+---[[
+    print( "found calibration file: " , calibfn )
+--]]
+    dofile( calibfn )
+    if self.calib then
+---[[
+      print( "calibration recovery succesful, writing data to chip" )
+--]]
+---
+      writebytes( self.i2cinterface, self.i2caddress, self.register.ACC_OFFSET_X_LSB, self.calib ,
+        function( data, ack )
+          if not ack then
+            i2c_err( self )
+          else
+            i2c_ok( self )
+---[[
+      print( "sucessfully wrote back calibration data to chip" )
+--]]
+            self.state = checkconfig
+          end
+        end
+      )
+---
+    else
+---[[
+      print( "calibration recovery did not succeed" )
+--]]
+      self.state = checkconfig
+    end
+  else
+---[[
+    print( "calibration file not found: " , calibfn )
+--]]
+    self.state = checkconfig
+  end
+end
+--
+checkconfig = function ( self )  -- FSM state: check configuration requests and apply them
 ---[[
   print( "checking/setting BNO055 configuration" )
 --]]
@@ -315,7 +394,7 @@ checkconfig = function ( self )  -- state 5: check configuration requests and ap
 --]]
 end
 --
-checkcalib = function( self )  -- state 6: check for effective calibration
+checkcalib = function( self )  -- FSM state: check for effective calibration
 --[[
   print( "Check for BNO055 calibration" )
 --]]
@@ -332,11 +411,11 @@ checkcalib = function( self )  -- state 6: check for effective calibration
         if ( bit.rshift( bit.band( calibvalue, 0x30 ) , 4) + bit.band( calibvalue, 0x03 )) >= 2 then  -- sum of gyro and magneto calib at least 2
           self.state = showcalib
 ---[[
-          print( ("BNO055 calibration effective: 0x%x"):format( calibvalue ) )
+          print( ("BNO055 calibration effective: 0x%02x"):format( calibvalue ) )
 --]]
         else
 ---[[
-          print( ("Incomplete BNO055 calibration: 0x%x"):format( calibvalue ) , " ...waiting" )
+          print( ("Incomplete BNO055 calibration: 0x%02x"):format( calibvalue ) , " ...waiting" )
 --]]
 --          post_err( self, calibvalue) ) -- *** FIX ME add a max limit ? -- Don't use post_err for this
         end
@@ -345,10 +424,11 @@ checkcalib = function( self )  -- state 6: check for effective calibration
   )
 end
 --
-showcalib = function( self )  -- state 7: show and store calibration values
+showcalib = function( self )  -- FSM state: show and store calibration values
 ---[[
   print( "Showing calibration values" )
 --]]
+-- datasheet recommends reading out the calibration values while in config mode, but this seems to work well also in running mode
   readbytes( self.i2cinterface, self.i2caddress, self.register.ACC_OFFSET_X_LSB, 22,
     function( data, ack )
       if not ack then
@@ -370,18 +450,19 @@ showcalib = function( self )  -- state 7: show and store calibration values
 --]]
         local calibv = ("%q"):format( data )
         local calibfn = self.name.."calibration"
-        print( "writing out ",calibv, "to file: ", calibfn )
-        local fh = file.open( calibfn , "w+")
-        if fh then
-          fh:writeline( self.name..".calib="..calibv )
-          fh:flush()
-          fh:close()
-          fh = nil
-        else
+        if not file.exists( calibfn ) then
+          print( "creating calibration file: " , calibfn , "with value: " , calibv )
+          local fh = file.open( calibfn , "w+")
+          if fh then
+            fh:writeline( self.name..".calib="..calibv )
+            fh:flush()
+            fh:close()
+            fh = nil
+          else
 -- *** FIX ME improve error reporting ?
-          print( "Could not write calibration values to file :", calibfn )
+            print( "Could not write calibration values to file :", calibfn )
+          end
         end
--- *** FIX ME write out calib values to file self.name .."calibration.lua"-- ** FIX ME update ok indicator
         self.state = monitor 
         self.health = "RUN"
         self.reset_count = 0
@@ -391,7 +472,7 @@ showcalib = function( self )  -- state 7: show and store calibration values
   )
 end
 --
-monitor = function( self )  -- state 8: monitor system health
+monitor = function( self )  -- FSM normal running state: monitor system health
 --[[
   print( "Monitoring BNO055 health" )
 --]]
@@ -446,7 +527,7 @@ geteuler = function( self )
 -- raw heading is 0-5760 ie 360*16
 -- pitch and roll are full 16 bit 2's complement, 16 LSB per degree
   if not self.health == "RUN" then return end
-  readbytes( self.i2cinterface, self.i2caddress, self.register.EULER_HEADING_LSB, 6,
+  readbytes( self.i2cinterface, self.i2caddress, self.register.EUL_heading_LSB, 6,
     function( data, ack )
       if not ack then
 ---[[
@@ -465,6 +546,194 @@ geteuler = function( self )
     end
   )
 end
+--
+getquat = function( self )
+-- return quaternion
+-- values are full 16 bit 2's complement
+  if not self.health == "RUN" then return end
+  readbytes( self.i2cinterface, self.i2caddress, self.register.QUA_data_w__LSB, 8,
+    function( data, ack )
+      if not ack then
+---[[
+        print( "getquat didn't get an answer" ) --*** FIX ME remove after debugging
+--]]
+        i2c_err( self )
+      else
+        i2c_ok( self )
+        -- decode and store values
+        local val = ( data:byte( 1 ) + bit.lshift( data:byte( 2 ), 8 ) )
+        if val>32767 then self.W = (val-65536)/ 32767 else self.W = val / 32767 end
+        local val = ( data:byte( 3 ) + bit.lshift( data:byte( 4 ), 8 ) )
+        if val>32767 then self.X = (val-65536) / 32767 else self.X = val / 32767 end
+        val = ( data:byte( 5 ) + bit.lshift( data:byte( 6 ), 8 ) )
+        if val>32767 then self.Y = (val-65536) / 32767 else self.Y = val / 32767 end
+        val = ( data:byte( 7 ) + bit.lshift( data:byte( 8 ), 8 ) )
+        if val>32767 then self.Z = (val-65536) / 32767 else self.Z = val / 32767 end
+---[[
+        local norm = math.sqrt( self.W * self.W +self.X * self.X +self.Y * self.Y + self.Z * self.Z)
+        print( "Quaternion: ",self.W , self.X , self.Y , self.Z , norm)
+--]]
+      end
+    end
+  )
+end
+--
+getgravity = function( self )
+-- return gravity vector
+-- vector components are full 16 bit 2's complement
+-- according to settings either 100 LSB for 1m/s2 or 1 LSB for 1 mg
+-- *** FIX ME code here assumes m/s2 setting
+  if not self.health == "RUN" then return end
+  readbytes( self.i2cinterface, self.i2caddress, self.register.GRAV_data_X_LSB, 6,
+    function( data, ack )
+      if not ack then
+---[[
+        print( "getgravity didn't get an answer" ) --*** FIX ME remove after debugging
+--]]
+        i2c_err( self )
+      else
+        i2c_ok( self )
+        -- decode and store values
+        local val = ( data:byte( 1 ) + bit.lshift( data:byte( 2 ), 8 ) )
+        if val>32767 then self.GRAV_X = (val-65536) / 100 else self.GRAV_X = val / 100 end
+        val = ( data:byte( 3 ) + bit.lshift( data:byte( 4 ), 8 ) )
+        if val>32767 then self.GRAV_Y = (val-65536) / 100 else self.GRAV_Y = val / 100 end
+        val = ( data:byte( 5 ) + bit.lshift( data:byte( 6 ), 8 ) )
+        if val>32767 then self.GRAV_Z = (val-65536) / 100 else self.GRAV_Z = val / 100 end
+---[[
+        local norm = math.sqrt( self.GRAV_X * self.GRAV_X +self.GRAV_Y * self.GRAV_Y + self.GRAV_Z * self.GRAV_Z)
+        print( "Gravity: ",self.GRAV_X, self.GRAV_Y, self.GRAV_Z, norm)
+--]]
+      end
+    end
+  )
+end
+--
+getlia = function( self )
+-- return linear acceleration vector
+-- vector components are full 16 bit 2's complement
+-- according to settings either 100 LSB for 1m/s2 or 1 LSB for 1 mg
+-- *** FIX ME code here assumes m/s2 setting
+  if not self.health == "RUN" then return end
+  readbytes( self.i2cinterface, self.i2caddress, self.register.LIA_data_X_LSB, 6,
+    function( data, ack )
+      if not ack then
+---[[
+        print( "getlia didn't get an answer" ) --*** FIX ME remove after debugging
+--]]
+        i2c_err( self )
+      else
+        i2c_ok( self )
+        -- decode and store values
+        local val = ( data:byte( 1 ) + bit.lshift( data:byte( 2 ), 8 ) )
+        if val>32767 then self.LIA_X = (val-65536) / 100 else self.LIA_X = val / 100 end
+        val = ( data:byte( 3 ) + bit.lshift( data:byte( 4 ), 8 ) )
+        if val>32767 then self.LIA_Y = (val-65536) / 100 else self.LIA_Y = val / 100 end
+        val = ( data:byte( 5 ) + bit.lshift( data:byte( 6 ), 8 ) )
+        if val>32767 then self.LIA_Z = (val-65536) / 100 else self.LIA_Z = val / 100 end
+---[[
+        local norm = math.sqrt( self.LIA_X * self.LIA_X +self.LIA_Y * self.LIA_Y + self.LIA_Z * self.LIA_Z)
+        print( "Linear acceleration: ",self.LIA_X, self.LIA_Y, self.LIA_Z, norm)
+--]]
+      end
+    end
+  )
+end
+--
+getmagnetic = function( self )
+-- *** FIX ME results are absurd in fusion modes, not tested in other modes, despite euler angles being ok ??!!
+-- return magnetic vector
+-- vector components are 13 bits for x and y, 15 bits for z
+-- single unit setting 16 LSB for 1 uT (2.5° heading accuracy with 30 uT horizontal component)
+  if not self.health == "RUN" then return end
+  readbytes( self.i2cinterface, self.i2caddress, self.register.MAG_DATA_X_LSB, 6,
+    function( data, ack )
+      if not ack then
+---[[
+        print( "getmagnetic didn't get an answer" ) --*** FIX ME remove after debugging
+--]]
+        i2c_err( self )
+      else
+        i2c_ok( self )
+        -- decode and store values
+        local val = ( data:byte( 1 ) + bit.lshift( data:byte( 2 ), 8 ) )
+        print( ("raw magx %d 0x%x"):format( val , val ) )
+        if val>32767 then self.MAG_X = (val-65536) / 16 else self.MAG_X = val / 16 end
+        val = ( data:byte( 3 ) + bit.lshift( data:byte( 4 ), 8 ) )
+        print( ("raw magy %d 0x%x"):format( val , val ) )
+        if val>32767 then self.MAG_Y = (val-65536) / 16 else self.MAG_Y = val / 16 end
+        val = ( data:byte( 5 ) + bit.lshift( data:byte( 6 ), 8 ) )
+        print( ("raw magz %d 0x%x"):format( val , val ) )
+        if val>32767 then self.MAG_Z = (val-65536) / 16 else self.MAG_Z = val / 16 end
+---[[
+        local norm = math.sqrt( self.MAG_X * self.MAG_X +self.MAG_Y * self.MAG_Y + self.MAG_Z * self.MAG_Z)
+        print( "Magnetic: ",self.MAG_X, self.MAG_Y, self.MAG_Z, norm)
+--]]
+      end
+    end
+  )
+end
+--
+getgyro = function( self )
+-- return gyro rates
+-- default unit setting 16 LSB for 1 DPS
+  if not self.health == "RUN" then return end
+  readbytes( self.i2cinterface, self.i2caddress, self.register.GYR_DATA_X_LSB, 6,
+    function( data, ack )
+      if not ack then
+---[[
+        print( "getgyro didn't get an answer" ) --*** FIX ME remove after debugging
+--]]
+        i2c_err( self )
+      else
+        i2c_ok( self )
+        -- decode and store values
+        local val = ( data:byte( 1 ) + bit.lshift( data:byte( 2 ), 8 ) )
+        if val>32767 then self.GYRO_X = (val-65536) / 16 else self.GYRO_X = val / 16 end
+        val = ( data:byte( 3 ) + bit.lshift( data:byte( 4 ), 8 ) )
+        if val>32767 then self.GYRO_Y = (val-65536) / 16 else self.GYRO_Y = val / 16 end
+        val = ( data:byte( 5 ) + bit.lshift( data:byte( 6 ), 8 ) )
+        if val>32767 then self.GYRO_Z = (val-65536) / 16 else self.GYRO_Z = val / 16 end
+--[[
+        print( "Gyro rates: ",self.GYRO_X, self.GYRO_Y, self.GYRO_Z )
+--]]
+      end
+    end
+  )
+end
+--
+getacc = function( self )
+-- return acceleromter data rates
+-- default unit setting 100 LSB for 1 m/s2
+  if not self.health == "RUN" then return end
+  readbytes( self.i2cinterface, self.i2caddress, self.register.ACC_DATA_X_LSB, 6,
+    function( data, ack )
+      if not ack then
+---[[
+        print( "getgyro didn't get an answer" ) --*** FIX ME remove after debugging
+--]]
+        i2c_err( self )
+      else
+        i2c_ok( self )
+        -- decode and store values
+        local val = ( data:byte( 1 ) + bit.lshift( data:byte( 2 ), 8 ) )
+        if val>32767 then self.GYRO_X = (val-65536) / 100 else self.GYRO_X = val / 100 end
+        val = ( data:byte( 3 ) + bit.lshift( data:byte( 4 ), 8 ) )
+        if val>32767 then self.GYRO_Y = (val-65536) / 100 else self.GYRO_Y = val / 100 end
+        val = ( data:byte( 5 ) + bit.lshift( data:byte( 6 ), 8 ) )
+        if val>32767 then self.GYRO_Z = (val-65536) / 100 else self.GYRO_Z = val / 100 end
+--[[
+        print( "Gyro rates: ",self.GYRO_X, self.GYRO_Y, self.GYRO_Z )
+--]]
+      end
+    end
+  )
+end
+--
+--
+--
+--
+--
 --
 readbytes = function( interface, address, register, nbytes, callback) -- block read multiple bytes from BNO registers and execute callback when done
   i2c.start( interface )
@@ -645,6 +914,12 @@ local function new( interface, address )
   bno.tick = tick
   bno.configure = configure
   bno.geteuler = geteuler
+  bno.getquat = getquat
+  bno.getlia = getlia
+  bno.getgravity = getgravity
+  bno.getmagnetic = getmagnetic
+  bno.getgyro = getgyro
+  bno.getacc = getacc
   return bno
 end
 --
